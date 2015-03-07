@@ -40,7 +40,6 @@ import org.apache.spark.streaming.StreamingContext.toPairDStreamFunctions
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.kinesis.KinesisUtils
 
-import org.apache.spark.mllib.clustering.StreamingKMeans
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.streaming.{Seconds, StreamingContext}
@@ -51,7 +50,7 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  * into two different streams.
  *
  * Usage:
- *   KMeans <streamRegion> <trainingStream> <testStream> <numClusters>
+ *   SNLearn <streamRegion> <trainingStream> <testStream>
  *
  * As you add data to `trainingStream` the clusters will continuously update.
  * Anytime you add data to `testStream`, you'll see predicted labels using the current model.
@@ -60,19 +59,19 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  *    $ export AWS_ACCESS_KEY_ID=<your-access-key>
  *    $ export AWS_SECRET_KEY=<your-secret-key>
  *    $ $SPARK_HOME/bin/run-example \
- *        com.alertlogic.alss.KMeans \
- *        us-east-1 trainingStream testStream 5
+ *        com.alertlogic.alss.SNLearn \
+ *        us-east-1 trainingStream testStream
  *
  * The access and secret keys will be picked up from EC2 metadata first if possible.
  *
  */
-object KMeans {
+object SNLearn {
 
   def main(args: Array[String]) {
     if (args.length != 4) {
       System.err.println(
-        "Usage: KMeans " +
-          "<sparkMaster> <streamRegion> <trainingStream> <testStream> <numClusters>")
+        "Usage: SNLearn " +
+          "<sparkMaster> <streamRegion> <trainingStream> <testStream>")
       System.exit(1)
     }
 
@@ -89,16 +88,28 @@ object KMeans {
     StreamingLogs.setLogLevels()
 
     val batchInterval = Milliseconds(2000)
-    val conf = new SparkConf().setAppName("KMeans")
+    val conf = new SparkConf().setAppName("SNLearn")
     val ssc = new StreamingContext(conf, batchInterval)
 
     val checkpointInterval = batchInterval
+    implicit val formats = org.json4s.DefaultFormats
 
-    val trainingStream = makeUnifiedStream(kinesisClient, endpointURL, ssc, checkpointInterval, trainingStreamName)
-    val trainingData = trainingStream.flatMap(json => parse(json))
+    val trainingStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
+                                           checkpointInterval, trainingStreamName)
+    val trainingParsed = trainingStream.map( byteArray =>
+            parse(new String(byteArray)).extract[List[SNRecord]])
 
-    val testStream = makeUnifiedStream(kinesisClient, endpointURL, ssc, checkpointInterval, testStreamName)
-    val testData = testStream.flatMap(json => parse(json))
+    val trainingKeyed = trainingParsed.map( record =>
+            ((record.customer_id, record.signature_id), record)
+                         
+    val trainingFeatures = trainingKeyed.updateStateByKey[Vector](
+        (record: SNRecord, state: Vector) =>
+            state)
+            
+    val testStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
+                                       checkpointInterval, testStreamName)
+    val testParsed = testStream.map(
+            byteArray => parse(new String(byteArray)).extract[List[SNRecord]])
 
     val numDimensions = 1
 
@@ -114,26 +125,40 @@ object KMeans {
     ssc.awaitTermination()
   }
   
-  def makeUnifiedStream[T: ClassTag](kinesisClient: AmazonKinesisClient,
-                                     endpointURL : String,
-                                     ssc: StreamingContext,
-                                     checkpointInterval: Duration,
-                                     streamName: String) : DStream[T] = {
+  def makeUnifiedStream(kinesisClient: AmazonKinesisClient,
+                        endpointURL : String,
+                        ssc: StreamingContext,
+                        checkpointInterval: Duration,
+                        streamName: String) : DStream[Array[Byte]] = {
     val numShards =
         kinesisClient.describeStream(streamName).getStreamDescription().getShards().size()
-    val streams = (0 until numShards).map
-        {
-            i => KinesisUtils.createStream(ssc,
-                                           streamName,
-                                           endpointURL,
-                                           checkpointInterval,
-                                           InitialPositionInStream.LATEST,
-                                           StorageLevel.MEMORY_AND_DISK_2)
-        }
-    return ssc.union(trainingStreams)
+    val streams = (0 until numShards).map { i =>
+        KinesisUtils.createStream(
+            ssc,
+            streamName,
+            endpointURL,
+            checkpointInterval,
+            InitialPositionInStream.LATEST,
+            StorageLevel.MEMORY_AND_DISK_2)
+    }
+    val unified = ssc.union(streams)
+    return unified
   }
     
 }
+
+
+case class SNRecord(
+    time: String,
+    customer_id: String,
+    signature_id: String,
+    sensor_id: String,
+    source_addr: String,
+    dest_addr: String)
+
+case class SNFeatures(
+    start: String,
+    count: Long)
 
 private object StreamingLogs extends Logging {
 
@@ -144,7 +169,7 @@ private object StreamingLogs extends Logging {
       // We first log something to initialize Spark's default logging, then we override the
       // logging level.
       logInfo("Setting log level to [WARN] for KMeans." +
-        " To override add a custom log4j.properties to the classpath.")
+              " To override add a custom log4j.properties to the classpath.")
       Logger.getRootLogger.setLevel(Level.WARN)
     }
   }
