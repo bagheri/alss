@@ -42,6 +42,7 @@ import org.apache.spark.streaming.kinesis.KinesisUtils
 
 import org.apache.spark.mllib.linalg.Vectors
 import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.mllib.clustering.StreamingKMeans
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 
 /**
@@ -66,6 +67,8 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  *
  */
 object SNLearn {
+
+  type MLVector = org.apache.spark.mllib.linalg.Vector
 
   def main(args: Array[String]) {
     if (args.length != 4) {
@@ -96,15 +99,14 @@ object SNLearn {
 
     val trainingStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
                                            checkpointInterval, trainingStreamName)
-    val trainingParsed = trainingStream.map( byteArray =>
-            parse(new String(byteArray)).extract[List[SNRecord]])
+    val trainingParsed = trainingStream.flatMap(
+            byteArray => parse(new String(byteArray)).extract[List[SNRecord]])
 
-    val trainingKeyed = trainingParsed.map( record =>
-            ((record.customer_id, record.signature_id), record)
+    val trainingKeyed = trainingParsed.map(
+        record => ((record.customer_id, record.signature_id), record) )
                          
-    val trainingFeatures = trainingKeyed.updateStateByKey[Vector](
-        (record: SNRecord, state: Vector) =>
-            state)
+    val trainingFeatures = trainingKeyed.updateStateByKey(
+        (records, state: Option[MLVector]) => updateFeatures(records, state))
             
     val testStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
                                        checkpointInterval, testStreamName)
@@ -118,7 +120,7 @@ object SNLearn {
       .setDecayFactor(1.0)
       .setRandomCenters(numDimensions, 0.0)
 
-    model.trainOn(trainingData)
+    model.trainOn(trainingFeatures)
     //model.predictOnValues(testData.map(lp => (lp.label, lp.features))).print()
 
     ssc.start()
@@ -143,6 +145,21 @@ object SNLearn {
     }
     val unified = ssc.union(streams)
     return unified
+  }
+
+  def updateFeatures(records: Seq[SNRecord],
+                     state: Option[MLVector]): Option[MLVector] =
+  {
+    val updated: Option[MLVector] =
+        state match {
+            case None => Some(Vectors.dense(1.0, 0.0))
+            case Some(v: MLVector) =>
+                Some(
+                    records.foldLeft(v)(
+                        (acc: MLVector, record: SNRecord) =>
+                            acc /*+ Vectors.dense(1.0, 1.0)*/ ))
+        }
+    return updated
   }
     
 }
