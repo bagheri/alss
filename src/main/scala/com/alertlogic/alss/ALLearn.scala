@@ -17,7 +17,8 @@
 
 package com.alertlogic.alss
 
-import scala.reflect.ClassTag
+import scala.reflect._
+import scala.reflect.runtime.universe._
 
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
@@ -40,7 +41,7 @@ import org.apache.spark.streaming.StreamingContext.toPairDStreamFunctions
 import org.apache.spark.streaming.dstream.DStream
 import org.apache.spark.streaming.kinesis.KinesisUtils
 
-import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.linalg.{Vectors, Vector => MLVector}
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.clustering.StreamingKMeans
 import org.apache.spark.streaming.{Seconds, StreamingContext}
@@ -51,7 +52,7 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  * into two different streams.
  *
  * Usage:
- *   SNLearn <streamRegion> <trainingStream> <testStream>
+ *   ALLearn <streamRegion> <trainingStream> <testStream>
  *
  * As you add data to `trainingStream` the clusters will continuously update.
  * Anytime you add data to `testStream`, you'll see predicted labels using the current model.
@@ -60,20 +61,18 @@ import org.apache.spark.streaming.{Seconds, StreamingContext}
  *    $ export AWS_ACCESS_KEY_ID=<your-access-key>
  *    $ export AWS_SECRET_KEY=<your-secret-key>
  *    $ $SPARK_HOME/bin/run-example \
- *        com.alertlogic.alss.SNLearn \
+ *        com.alertlogic.alss.ALLearn \
  *        us-east-1 trainingStream testStream
  *
  * The access and secret keys will be picked up from EC2 metadata first if possible.
  *
  */
-object SNLearn {
-
-  type MLVector = org.apache.spark.mllib.linalg.Vector
+object ALLearn {
 
   def main(args: Array[String]) {
     if (args.length != 4) {
       System.err.println(
-        "Usage: SNLearn " +
+        "Usage: ALLearn " +
           "<sparkMaster> <streamRegion> <trainingStream> <testStream>")
       System.exit(1)
     }
@@ -83,35 +82,28 @@ object SNLearn {
     val trainingStreamName = args(2)
     val testStreamName = args(3)
     val numClusters = args(4).toInt
-    val endpointURL = "https://kinesis." + streamRegion + ".amazonaws.com"
     
     val kinesisClient = new AmazonKinesisClient(new DefaultAWSCredentialsProviderChain())
-    kinesisClient.setEndpoint(endpointURL)
 
     StreamingLogs.setLogLevels()
-
+  
     val batchInterval = Milliseconds(2000)
-    val conf = new SparkConf().setAppName("SNLearn")
+    val conf = new SparkConf().setAppName("ALLearn")
     val ssc = new StreamingContext(conf, batchInterval)
 
     val checkpointInterval = batchInterval
-    implicit val formats = org.json4s.DefaultFormats
 
-    val trainingStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
-                                           checkpointInterval, trainingStreamName)
-    val trainingParsed = trainingStream.flatMap(
-            byteArray => parse(new String(byteArray)).extract[List[SNRecord]])
+    val trainingStream = makeRecordStream[SNRecord](kinesisClient, streamRegion, ssc,
+                                                    checkpointInterval, trainingStreamName)
 
-    val trainingKeyed = trainingParsed.map(
+    val trainingKeyed = trainingStream.map(
         record => ((record.customer_id, record.signature_id), record) )
                          
     val trainingFeatures = trainingKeyed.updateStateByKey(
         (records, state: Option[MLVector]) => updateFeatures(records, state))
             
-    val testStream = makeUnifiedStream(kinesisClient, endpointURL, ssc,
-                                       checkpointInterval, testStreamName)
-    val testParsed = testStream.map(
-            byteArray => parse(new String(byteArray)).extract[List[SNRecord]])
+    val testStream = makeRecordStream[SNRecord](kinesisClient, streamRegion, ssc,
+                                                checkpointInterval, testStreamName)
 
     val numDimensions = 1
 
@@ -127,11 +119,14 @@ object SNLearn {
     ssc.awaitTermination()
   }
   
-  def makeUnifiedStream(kinesisClient: AmazonKinesisClient,
-                        endpointURL : String,
-                        ssc: StreamingContext,
-                        checkpointInterval: Duration,
-                        streamName: String) : DStream[Array[Byte]] = {
+  def makeUnifiedStream(
+      kinesisClient: AmazonKinesisClient,
+      streamRegion : String,
+      ssc: StreamingContext,
+      checkpointInterval: Duration,
+      streamName: String) : DStream[Array[Byte]] = {
+    val endpointURL = "https://kinesis." + streamRegion + ".amazonaws.com"
+    kinesisClient.setEndpoint(endpointURL)
     val numShards =
         kinesisClient.describeStream(streamName).getStreamDescription().getShards().size()
     val streams = (0 until numShards).map { i =>
@@ -141,15 +136,29 @@ object SNLearn {
             endpointURL,
             checkpointInterval,
             InitialPositionInStream.LATEST,
-            StorageLevel.MEMORY_AND_DISK_2)
-    }
+            StorageLevel.MEMORY_AND_DISK_2)}
     val unified = ssc.union(streams)
     return unified
   }
 
-  def updateFeatures(records: Seq[SNRecord],
-                     state: Option[MLVector]): Option[MLVector] =
-  {
+  def makeRecordStream[T: ClassTag](
+      kinesisClient: AmazonKinesisClient,
+      streamRegion : String,
+      ssc: StreamingContext,
+      checkpointInterval: Duration,
+      streamName: String)
+      (implicit m: Manifest[List[T]]) : DStream[T] = {
+    implicit val formats = org.json4s.DefaultFormats
+    val rawStream = makeUnifiedStream(kinesisClient, streamRegion, ssc,
+                                      checkpointInterval, streamName)
+    val parsedStream = rawStream.flatMap(
+            byteArray => parse(new String(byteArray)).extract[List[T]])
+    return parsedStream
+  }
+
+  def updateFeatures(
+      records: Seq[SNRecord],
+      state: Option[MLVector]): Option[MLVector] = {
     val updated: Option[MLVector] =
         state match {
             case None => Some(Vectors.dense(1.0, 0.0))
@@ -157,7 +166,7 @@ object SNLearn {
                 Some(
                     records.foldLeft(v)(
                         (acc: MLVector, record: SNRecord) =>
-                            acc /*+ Vectors.dense(1.0, 1.0)*/ ))
+                            Vectors.dense(acc(0) + 1.0, acc(1) + 1.0)))
         }
     return updated
   }
