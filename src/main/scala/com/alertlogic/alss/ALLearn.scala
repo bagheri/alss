@@ -73,37 +73,40 @@ object ALLearn {
     if (args.length != 4) {
       System.err.println(
         "Usage: ALLearn " +
-          "<sparkMaster> <streamRegion> <trainingStream> <testStream>")
+          "<streamRegion> <trainingStream> <testStream>")
       System.exit(1)
     }
 
-    val master = args(0)
-    val streamRegion = args(1)
-    val trainingStreamName = args(2)
-    val testStreamName = args(3)
-    val numClusters = args(4).toInt
+    val streamRegion = args(0)
+    val streamPrefix = args(1)
+
+    val logStreamName = streamPrefix + "_log"
+    val snortStreamName = streamPrefix + "_snort"
+    val incidentStreamName = streamPrefix + "_inc"
     
     val kinesisClient = new AmazonKinesisClient(new DefaultAWSCredentialsProviderChain())
 
     StreamingLogs.setLogLevels()
   
     val batchInterval = Milliseconds(2000)
-    val conf = new SparkConf().setAppName("ALLearn")
+    val conf = new SparkConf().setMaster("local").setAppName("ALLearn")
     val ssc = new StreamingContext(conf, batchInterval)
 
     val checkpointInterval = batchInterval
 
-    val trainingStream = makeRecordStream[SNRecord](kinesisClient, streamRegion, ssc,
-                                                    checkpointInterval, trainingStreamName)
+    val snortStream = makeRecordStream[SNRecord](kinesisClient, ssc,
+                                                    checkpointInterval,
+                                                    streamRegion, snortStreamName)
 
-    val trainingKeyed = trainingStream.map(
+    val snortKeyed = snortStream.map(
         record => ((record.customer_id, record.signature_id), record) )
                          
-    val trainingFeatures = trainingKeyed.updateStateByKey(
+    val snortFeatures = snortKeyed.updateStateByKey(
         (records, state: Option[MLVector]) => updateFeatures(records, state))
             
-    val testStream = makeRecordStream[SNRecord](kinesisClient, streamRegion, ssc,
-                                                checkpointInterval, testStreamName)
+    val testStream = makeRecordStream[SNRecord](kinesisClient, ssc,
+                                                checkpointInterval,
+                                                streamRegion, testStreamName)
 
     val numDimensions = 1
 
@@ -121,9 +124,9 @@ object ALLearn {
   
   def makeUnifiedStream(
       kinesisClient: AmazonKinesisClient,
-      streamRegion : String,
       ssc: StreamingContext,
       checkpointInterval: Duration,
+      streamRegion: String,
       streamName: String) : DStream[Array[Byte]] = {
     val endpointURL = "https://kinesis." + streamRegion + ".amazonaws.com"
     kinesisClient.setEndpoint(endpointURL)
@@ -143,14 +146,15 @@ object ALLearn {
 
   def makeRecordStream[T: ClassTag](
       kinesisClient: AmazonKinesisClient,
-      streamRegion : String,
       ssc: StreamingContext,
       checkpointInterval: Duration,
+      streamRegion: String,
       streamName: String)
       (implicit m: Manifest[List[T]]) : DStream[T] = {
     implicit val formats = org.json4s.DefaultFormats
-    val rawStream = makeUnifiedStream(kinesisClient, streamRegion, ssc,
-                                      checkpointInterval, streamName)
+    val rawStream = makeUnifiedStream(kinesisClient, ssc,
+                                      checkpointInterval,
+                                      streamRegion, streamName)
     val parsedStream = rawStream.flatMap(
             byteArray => parse(new String(byteArray)).extract[List[T]])
     return parsedStream
@@ -163,16 +167,13 @@ object ALLearn {
         state match {
             case None => Some(Vectors.dense(1.0, 0.0))
             case Some(v: MLVector) =>
-                Some(
-                    records.foldLeft(v)(
+                Some(records.foldLeft(v)(
                         (acc: MLVector, record: SNRecord) =>
                             Vectors.dense(acc(0) + 1.0, acc(1) + 1.0)))
         }
     return updated
   }
-    
 }
-
 
 case class SNRecord(
     time: String,
@@ -181,10 +182,6 @@ case class SNRecord(
     sensor_id: String,
     source_addr: String,
     dest_addr: String)
-
-case class SNFeatures(
-    start: String,
-    count: Long)
 
 private object StreamingLogs extends Logging {
 
